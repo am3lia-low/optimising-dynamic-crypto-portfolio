@@ -1,4 +1,5 @@
 import os
+import ast
 import pandas as pd
 import numpy as np
 import warnings
@@ -17,9 +18,12 @@ start_time = time.perf_counter()
 # =========================
 # Paths and settings
 # =========================
-data_dir = os.path.expanduser("~/Desktop/monthly klines csv/prices_cleaned")
-output_dir = os.path.expanduser("~/Desktop/monthly klines csv/arima_order_selection_outputs")
+data_dir = "klines csv data/prices_cleaned"
+selection_dir = "ARIMA results"
+output_dir = "ARIMA results"
 os.makedirs(output_dir, exist_ok=True)
+
+selected_orders_path = os.path.join(selection_dir, "arima_selected_orders.csv")
 
 BASE_DATE = pd.Timestamp("2022-04-01")
 REBAL_INTERVAL = 7
@@ -27,22 +31,10 @@ TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
 TEST_RATIO = 0.2
 
-P_VALUES = range(0, 4)   # 0,1,2,3
-D_VALUES = range(0, 2)   # 0,1
-Q_VALUES = range(0, 4)   # 0,1,2,3
-
-candidate_orders = [(p, d, q) for p in P_VALUES for d in D_VALUES for q in Q_VALUES]
-
 # =========================
 # Helper functions
 # =========================
 def parse_mixed_time(series, base_date):
-    """
-    Handle mixed time formats row by row:
-    - small values: relative seconds from base_date
-    - medium values: Unix seconds
-    - very large values: Unix milliseconds
-    """
     s = pd.to_numeric(series, errors="coerce")
     parsed = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
 
@@ -98,36 +90,6 @@ def split_series(df, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2):
     return train, val, test
 
 
-def returns_to_price_path(start_price, forecast_returns):
-    prices = []
-    prev_price = float(start_price)
-
-    for r in forecast_returns:
-        next_price = prev_price * (1.0 + float(r))
-        prices.append(next_price)
-        prev_price = next_price
-
-    return np.array(prices)
-
-
-def calc_metrics(actual, predicted):
-    mae = mean_absolute_error(actual, predicted)
-    rmse = np.sqrt(mean_squared_error(actual, predicted))
-    r2 = r2_score(actual, predicted)
-    return mae, rmse, r2
-
-
-def forecast_is_valid(arr, expected_len):
-    arr = np.asarray(arr, dtype=float)
-    if len(arr) != expected_len:
-        return False
-    if np.isnan(arr).any():
-        return False
-    if np.isinf(arr).any():
-        return False
-    return True
-
-
 def fit_arima_safe(series_values, order):
     model = ARIMA(
         series_values,
@@ -139,23 +101,55 @@ def fit_arima_safe(series_values, order):
     return fitted
 
 
-def walk_forward_rebalance_forecasts_fast(pre_block, target_block, order, rebal_interval=7):
-    """
-    Validation-stage version:
-    fit once on pre_block, then update with append(..., refit=False)
-    """
+def fit_and_forecast(series_values, steps, order):
+    fitted = fit_arima_safe(series_values, order)
+    forecast = fitted.forecast(steps=steps)
+    return fitted, forecast
+
+
+def returns_to_price_path(start_price, forecast_returns):
+    prices = []
+    prev_price = float(start_price)
+    for r in forecast_returns:
+        next_price = prev_price * (1.0 + float(r))
+        prices.append(next_price)
+        prev_price = next_price
+    return np.array(prices)
+
+
+def calc_metrics(actual, predicted):
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    r2 = r2_score(actual, predicted)
+    return mae, rmse, r2
+
+
+def forecast_is_valid(arr, expected_len):
+    arr = np.asarray(arr)
+    if len(arr) != expected_len:
+        return False
+    if np.isnan(arr).any():
+        return False
+    if np.isinf(arr).any():
+        return False
+    return True
+
+
+def walk_forward_rebalance_forecasts_strict(pre_block, target_block, order, rebal_interval=7):
     rebalance_forecasts = []
     rebalance_actuals = []
     rebalance_timestamps = []
-
-    history_values = pre_block["return_1step"].to_numpy(dtype=float)
-    fitted = fit_arima_safe(history_values, order)
 
     rebal_indices = list(range(0, len(target_block), rebal_interval))
 
     for idx in rebal_indices:
         if idx + rebal_interval > len(target_block):
             break
+
+        history_returns = pd.concat([
+            pre_block["return_1step"],
+            target_block["return_1step"].iloc[:idx]
+        ], ignore_index=True)
 
         if idx == 0:
             last_price = pre_block["close"].iloc[-1]
@@ -166,20 +160,17 @@ def walk_forward_rebalance_forecasts_fast(pre_block, target_block, order, rebal_
         actual_return = (float(actual_end_price) / float(last_price)) - 1.0
 
         try:
-            forecast_steps = fitted.forecast(steps=rebal_interval)
+            _, forecast_steps = fit_and_forecast(history_returns.to_numpy(dtype=float), rebal_interval, order)
 
             if not forecast_is_valid(forecast_steps, rebal_interval):
                 raise ValueError("invalid forecast")
 
-            forecast_prices = returns_to_price_path(last_price, forecast_steps)
+            forecast_prices = returns_to_price_path(last_price, np.asarray(forecast_steps))
             forecast_return = (forecast_prices[-1] / float(last_price)) - 1.0
 
             rebalance_forecasts.append(forecast_return)
             rebalance_actuals.append(actual_return)
             rebalance_timestamps.append(target_block["parsed_time"].iloc[idx])
-
-            new_actual_data = target_block["return_1step"].iloc[idx: idx + rebal_interval].to_numpy(dtype=float)
-            fitted = fitted.append(new_actual_data, refit=False)
 
         except Exception:
             continue
@@ -187,68 +178,30 @@ def walk_forward_rebalance_forecasts_fast(pre_block, target_block, order, rebal_
     return rebalance_timestamps, rebalance_forecasts, rebalance_actuals
 
 
-def tune_orders_on_validation(train, val, candidate_orders, rebal_interval=7):
-    best = None
-    tuning_log = []
-
-    for order in candidate_orders:
-        try:
-            ts, val_forecasts, val_actuals = walk_forward_rebalance_forecasts_fast(
-                pre_block=train,
-                target_block=val,
-                order=order,
-                rebal_interval=rebal_interval,
-            )
-
-            if len(val_forecasts) < 5:
-                tuning_log.append((order, "too few valid validation forecasts"))
-                continue
-
-            val_mae, val_rmse, val_r2 = calc_metrics(val_actuals, val_forecasts)
-            tuning_log.append((order, val_rmse))
-
-            if best is None or val_rmse < best["val_rmse"]:
-                best = {
-                    "order_used": order,
-                    "val_mae": val_mae,
-                    "val_rmse": val_rmse,
-                    "val_r2": val_r2,
-                    "num_val_rebalances": len(val_forecasts),
-                }
-
-        except Exception as e:
-            tuning_log.append((order, str(e)))
-            continue
-
-    return best, tuning_log
-
-
 # =========================
 # Main
 # =========================
-usable_files = []
-for file_name in sorted(os.listdir(data_dir)):
-    file_path = os.path.join(data_dir, file_name)
+if not os.path.exists(selected_orders_path):
+    raise FileNotFoundError(
+        f"Cannot find selected orders file: {selected_orders_path}\nRun Part 1 first."
+    )
 
-    if not os.path.isfile(file_path):
-        continue
-    if file_name.startswith("."):
-        continue
-    if file_name.endswith((".py", ".npy", ".txt", ".ipynb", ".xlsx", ".keras", ".csv")):
-        continue
-
-    usable_files.append(file_name)
-
-print(f"Found {len(usable_files)} usable files.")
-print("Files:", usable_files)
-print(f"Trying {len(candidate_orders)} candidate ARIMA orders per coin...")
+selected_orders_df = pd.read_csv(selected_orders_path)
 
 summary_rows = []
+all_test_forecast_rows = []
+all_test_actual_rows = []
 skipped = []
 
-for file_name in usable_files:
-    print(f"\nProcessing {file_name} ...")
+print(f"Loaded selected orders from: {selected_orders_path}")
+print(f"Number of coins to process: {len(selected_orders_df)}")
+
+for _, row in selected_orders_df.iterrows():
+    file_name = row["crypto"]
+    order = ast.literal_eval(row["order_used"])
     file_path = os.path.join(data_dir, file_name)
+
+    print(f"\nProcessing {file_name} with selected order {order} ...")
 
     try:
         df = load_and_preprocess(file_path)
@@ -262,32 +215,58 @@ for file_name in usable_files:
             print("  Skipped: not enough data")
             continue
 
-        best_result, tuning_log = tune_orders_on_validation(
-            train=train,
-            val=val,
-            candidate_orders=candidate_orders,
-            rebal_interval=REBAL_INTERVAL,
+        pre_test = pd.concat([train, val], ignore_index=True)
+
+        test_timestamps, test_forecasts, test_actuals = walk_forward_rebalance_forecasts_strict(
+            pre_block=pre_test,
+            target_block=test,
+            order=order,
+            rebal_interval=REBAL_INTERVAL
         )
 
-        if best_result is None:
-            skipped.append((file_name, tuning_log))
-            print("  Skipped: no valid ARIMA order found")
+        if len(test_forecasts) < 5:
+            skipped.append((file_name, "too few valid test rebalances"))
+            print("  Skipped: too few valid test rebalances")
             continue
+
+        test_mae, test_rmse, test_r2 = calc_metrics(test_actuals, test_forecasts)
 
         summary_rows.append({
             "crypto": file_name,
-            "order_used": best_result["order_used"],
-            "train_size": len(train),
-            "val_size": len(val),
-            "test_size": len(test),
-            "num_val_rebalances": best_result["num_val_rebalances"],
-            "val_mae": best_result["val_mae"],
-            "val_rmse": best_result["val_rmse"],
-            "val_r2": best_result["val_r2"],
+            "order_used": order,
+            "num_test_rebalances": len(test_forecasts),
+            "test_mae": test_mae,
+            "test_rmse": test_rmse,
+            "test_r2": test_r2,
         })
 
-        print(f"  Selected order: {best_result['order_used']}")
-        print(f"  Validation RMSE: {best_result['val_rmse']:.8f}")
+        test_out = pd.DataFrame({
+            "timestamp": test_timestamps,
+            "crypto": file_name,
+            "actual_return_7d": test_actuals,
+            "forecast_return_7d": test_forecasts,
+        })
+        test_out.to_csv(
+            os.path.join(output_dir, f"{file_name}_rebalance_7d_test_forecasts.csv"),
+            index=False
+        )
+
+        all_test_forecast_rows.append(
+            pd.DataFrame({
+                "timestamp": test_timestamps,
+                "crypto": file_name,
+                "value": test_forecasts
+            })
+        )
+        all_test_actual_rows.append(
+            pd.DataFrame({
+                "timestamp": test_timestamps,
+                "crypto": file_name,
+                "value": test_actuals
+            })
+        )
+
+        print(f"  Test RMSE: {test_rmse:.8f}")
 
     except Exception as e:
         skipped.append((file_name, str(e)))
@@ -295,16 +274,57 @@ for file_name in usable_files:
 
 summary_df = pd.DataFrame(summary_rows)
 if len(summary_df) > 0:
-    summary_df = summary_df.sort_values("val_rmse")
-    summary_path = os.path.join(output_dir, "arima_selected_orders.csv")
+    summary_df = summary_df.sort_values("test_rmse")
+    summary_path = os.path.join(output_dir, "arima_7d_rebalance_test_summary.csv")
     summary_df.to_csv(summary_path, index=False)
-    print(f"\nSaved selected orders to: {summary_path}")
+    print(f"\nSaved test summary to: {summary_path}")
+
+if len(all_test_forecast_rows) > 0:
+    forecast_long = pd.concat(all_test_forecast_rows, ignore_index=True)
+    forecast_matrix_df = forecast_long.pivot(index="timestamp", columns="crypto", values="value")
+    forecast_matrix_df = forecast_matrix_df.sort_index().sort_index(axis=1)
+    forecast_matrix_df = forecast_matrix_df.dropna(axis=0, how="any")
+
+    forecast_csv = os.path.join(output_dir, "ARIMA_test_7d_rebalance_forecast_matrix.csv")
+    forecast_npy = os.path.join(output_dir, "ARIMA_test_7d_rebalance_forecast_matrix.npy")
+
+    forecast_matrix_df.to_csv(forecast_csv)
+    np.save(forecast_npy, forecast_matrix_df.to_numpy())
+
+    print(f"Saved forecast matrix to: {forecast_csv}")
+    print(f"Forecast matrix shape: {forecast_matrix_df.shape}")
+
+if len(all_test_actual_rows) > 0:
+    actual_long = pd.concat(all_test_actual_rows, ignore_index=True)
+    actual_matrix_df = actual_long.pivot(index="timestamp", columns="crypto", values="value")
+    actual_matrix_df = actual_matrix_df.sort_index().sort_index(axis=1)
+    actual_matrix_df = actual_matrix_df.dropna(axis=0, how="any")
+
+    if 'forecast_matrix_df' in locals():
+        common_idx = forecast_matrix_df.index.intersection(actual_matrix_df.index)
+        common_cols = forecast_matrix_df.columns.intersection(actual_matrix_df.columns)
+        forecast_matrix_df = forecast_matrix_df.loc[common_idx, common_cols]
+        actual_matrix_df = actual_matrix_df.loc[common_idx, common_cols]
+
+        forecast_csv = os.path.join(output_dir, "ARIMA_test_7d_rebalance_forecast_matrix.csv")
+        forecast_npy = os.path.join(output_dir, "ARIMA_test_7d_rebalance_forecast_matrix.npy")
+        forecast_matrix_df.to_csv(forecast_csv)
+        np.save(forecast_npy, forecast_matrix_df.to_numpy())
+
+    actual_csv = os.path.join(output_dir, "ARIMA_test_7d_rebalance_actual_matrix.csv")
+    actual_npy = os.path.join(output_dir, "ARIMA_test_7d_rebalance_actual_matrix.npy")
+
+    actual_matrix_df.to_csv(actual_csv)
+    np.save(actual_npy, actual_matrix_df.to_numpy())
+
+    print(f"Saved actual matrix to: {actual_csv}")
+    print(f"Actual matrix shape: {actual_matrix_df.shape}")
 
 if len(skipped) > 0:
     skipped_df = pd.DataFrame(skipped, columns=["crypto", "reason"])
-    skipped_path = os.path.join(output_dir, "arima_order_selection_skipped.csv")
+    skipped_path = os.path.join(output_dir, "arima_7d_rebalance_test_skipped.csv")
     skipped_df.to_csv(skipped_path, index=False)
     print(f"Saved skipped log to: {skipped_path}")
 
 end_time = time.perf_counter()
-print(f"\nOrder selection done. Runtime: {end_time - start_time:.2f} seconds")
+print(f"\nStrict 7-day rebalance test done. Runtime: {end_time - start_time:.2f} seconds")
