@@ -19,8 +19,8 @@ start_time = time.perf_counter()
 # Paths and settings
 # =========================
 data_dir = "klines csv data/prices_cleaned"
-selection_dir = "ARIMA results"
-output_dir = "ARIMA results"
+selection_dir = "11 ARIMA results"
+output_dir = "11 ARIMA results"
 os.makedirs(output_dir, exist_ok=True)
 
 selected_orders_path = os.path.join(selection_dir, "arima_selected_orders.csv")
